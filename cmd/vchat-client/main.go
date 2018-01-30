@@ -244,7 +244,7 @@ func (p *process) outputLoop() {
 				return
 			}
 			err = p.stream.Write()
-			if err != nil {
+			if err != nil && err != portaudio.OutputUnderflowed {
 				log.Printf("error write to audio stream : %v", err)
 				return
 			}
