@@ -139,7 +139,7 @@ func (r *Room) run() {
 
 			r.clients.Range(func(key, value interface{}) bool {
 				c := value.(*Client)
-				r.conn.WriteTo(buf, c.Addr)
+				r.conn.WriteToUDP(buf, c.Addr)
 				return true
 			})
 		}
