@@ -148,7 +148,7 @@ func (c *Client) readLoop() {
 				return
 			}
 		default:
-			n, _, err := c.conn.ReadFromUDP(buf)
+			n, err := c.conn.Read(buf)
 			if err != nil {
 				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
 					// ignore
