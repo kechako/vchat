@@ -102,10 +102,12 @@ func (err ParseFlagsError) Error() string {
 func (p *process) parseArgs() error {
 	var addr string
 	var echo bool
+	var channels int
 	var sampleRate int
 	var frameSize int
 	flag.StringVar(&addr, "addr", "localhost:8080", "address to connect")
 	flag.BoolVar(&echo, "echo", false, "echo")
+	flag.IntVar(&channels, "channels", DefaultChannels, "Audio channels")
 	flag.IntVar(&sampleRate, "rate", DefaultSampleRate, "Audio sample rate")
 	flag.IntVar(&frameSize, "fsize", DefaultFrameSize, "Audio frame size")
 	flag.Parse()
@@ -116,6 +118,7 @@ func (p *process) parseArgs() error {
 
 	p.addr = addr
 	p.echo = echo
+	p.channels = channels
 	p.sampleRate = sampleRate
 	p.frameSize = frameSize
 
