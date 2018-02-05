@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -94,6 +93,12 @@ func (p *process) init() error {
 	return nil
 }
 
+type ParseFlagsError string
+
+func (err ParseFlagsError) Error() string {
+	return string(err)
+}
+
 func (p *process) parseArgs() error {
 	var addr string
 	var echo bool
@@ -106,7 +111,7 @@ func (p *process) parseArgs() error {
 	flag.Parse()
 
 	if addr == "" {
-		return errors.New("invalid address")
+		return ParseFlagsError("invalid address")
 	}
 
 	p.addr = addr
@@ -287,12 +292,10 @@ func run() (int, error) {
 
 	p, err := newProcess()
 	if err != nil {
+		if _, ok := err.(ParseFlagsError); ok {
+			return 2, err
+		}
 		return 1, err
-	}
-
-	err = p.parseArgs()
-	if err != nil {
-		return 2, err
 	}
 
 	err = p.run()
