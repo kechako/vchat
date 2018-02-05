@@ -16,9 +16,10 @@ var DefaultReceiveBufferSize = 1024
 var DefaultSendBufferSize = 1024
 
 type Client struct {
-	ClientID uuid.UUID
-	Receive  chan []byte
-	send     chan []byte
+	ClientID    uuid.UUID
+	Receive     chan vchat.AudioFrame
+	send        chan vchat.AudioFrame
+	audioPacket vchat.Packet
 
 	Echo bool
 
@@ -30,7 +31,6 @@ type Client struct {
 }
 
 func NewClient(addr string) (*Client, error) {
-	fmt.Println(vchat.PacketJoin, vchat.PacketLeave, vchat.PacketAudio)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -41,10 +41,15 @@ func NewClient(addr string) (*Client, error) {
 		return nil, err
 	}
 
+	clientID := uuid.NewV4()
 	c := &Client{
-		ClientID:   uuid.NewV4(),
-		Receive:    make(chan []byte, DefaultReceiveBufferSize),
-		send:       make(chan []byte, DefaultSendBufferSize),
+		ClientID: clientID,
+		Receive:  make(chan vchat.AudioFrame, DefaultReceiveBufferSize),
+		send:     make(chan vchat.AudioFrame, DefaultSendBufferSize),
+		audioPacket: vchat.Packet{
+			Type:     vchat.PacketAudio,
+			ClientID: clientID,
+		},
 		remoteAddr: udpAddr,
 		conn:       conn,
 		exit:       make(chan struct{}),
@@ -102,8 +107,8 @@ func (c *Client) Leave() error {
 	return nil
 }
 
-func (c *Client) Send(data []byte) {
-	c.send <- data
+func (c *Client) Send(frame vchat.AudioFrame) {
+	c.send <- frame
 }
 
 func (c *Client) sendLoop() {
@@ -115,21 +120,16 @@ func (c *Client) sendLoop() {
 			if !ok {
 				return
 			}
-		case data := <-c.send:
-			p := vchat.Packet{
-				ClientID: c.ClientID,
-				Type:     vchat.PacketAudio,
-				Data:     data,
-			}
+		case frame := <-c.send:
+			c.audioPacket.AudioFrames = []vchat.AudioFrame{frame}
 			buf.Reset()
-			_, err := p.WriteTo(buf)
+			_, err := c.audioPacket.WriteTo(buf)
 			if err != nil {
 				log.Printf("error : %v", err)
 				break
 			}
 
-			sendData := buf.Bytes()
-			_, err = c.conn.Write(sendData)
+			_, err = c.conn.Write(buf.Bytes())
 			if err != nil {
 				log.Printf("error : %v", err)
 				break
@@ -174,7 +174,9 @@ func (c *Client) readLoop() {
 				break
 			}
 
-			c.Receive <- p.Data
+			for _, frame := range p.AudioFrames {
+				c.Receive <- frame
+			}
 		}
 	}
 }

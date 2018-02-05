@@ -1,18 +1,27 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/gordonklaus/portaudio"
+	"github.com/hraban/opus"
+	"github.com/kechako/vchat"
+)
+
+const (
+	DefaultBitDepth       = 16
+	DefaultChannels       = 1
+	DefaultSampleRate     = 48000
+	DefaultFrameSize      = 480
+	DefaultOpusDataLength = 1000
 )
 
 type process struct {
@@ -20,14 +29,18 @@ type process struct {
 	echo   bool
 	client *Client
 
+	channels       int
+	sampleRate     int
+	frameSize      int
+	frameSizeMs    float32
+	opusDataLength int
+
 	stream *portaudio.Stream
 	inbuf  []int16
 	outbuf []int16
 
-	inputReader  *io.PipeReader
-	inputWriter  *io.PipeWriter
-	outputReader *io.PipeReader
-	outputWriter *io.PipeWriter
+	opusEnc *opus.Encoder
+	opusDec *opus.Decoder
 
 	inputSize   uint64
 	sendSize    uint64
@@ -38,31 +51,58 @@ type process struct {
 	exit chan struct{}
 }
 
-func newProcess() *process {
-	ir, iw := io.Pipe()
-	or, ow := io.Pipe()
+func newProcess() (p *process, err error) {
+	p = &process{
+		channels:       DefaultChannels,
+		sampleRate:     DefaultSampleRate,
+		frameSize:      DefaultFrameSize,
+		opusDataLength: DefaultOpusDataLength,
+		wg:             &sync.WaitGroup{},
+		exit:           make(chan struct{}),
+	}
 
-	p := &process{
-		exit:         make(chan struct{}),
-		inputReader:  ir,
-		inputWriter:  iw,
-		outputReader: or,
-		outputWriter: ow,
-		wg:           &sync.WaitGroup{},
+	err = p.parseArgs()
+	if err != nil {
+		return
+	}
+
+	err = p.init()
+	if err != nil {
+		return
 	}
 
 	ch := make(chan os.Signal)
 	go p.waitSignal(ch)
 	signal.Notify(ch, os.Interrupt)
 
-	return p
+	return
+}
+
+func (p *process) init() error {
+	frameSizeMs := float32(p.frameSize) / float32(p.channels) * 1000 / float32(p.sampleRate)
+	switch frameSizeMs {
+	case 2.5, 5, 10, 20, 40, 60:
+		// Good.
+	default:
+		return fmt.Errorf("Illegal frame size: %d bytes (%f ms)", p.frameSize, frameSizeMs)
+	}
+	p.frameSizeMs = frameSizeMs
+
+	p.inbuf = make([]int16, p.frameSize)
+	p.outbuf = make([]int16, p.frameSize)
+
+	return nil
 }
 
 func (p *process) parseArgs() error {
 	var addr string
 	var echo bool
+	var sampleRate int
+	var frameSize int
 	flag.StringVar(&addr, "addr", "localhost:8080", "address to connect")
 	flag.BoolVar(&echo, "echo", false, "echo")
+	flag.IntVar(&sampleRate, "rate", DefaultSampleRate, "Audio sample rate")
+	flag.IntVar(&frameSize, "fsize", DefaultFrameSize, "Audio frame size")
 	flag.Parse()
 
 	if addr == "" {
@@ -71,6 +111,8 @@ func (p *process) parseArgs() error {
 
 	p.addr = addr
 	p.echo = echo
+	p.sampleRate = sampleRate
+	p.frameSize = frameSize
 
 	return nil
 }
@@ -100,15 +142,8 @@ func (p *process) run() error {
 	portaudio.Initialize()
 	defer portaudio.Terminate()
 
-	const bitDepth = 16
-	const channels = 1
-	const sampleRate = 8000
-	const bufferLength = 500
-
 	// open default stream
-	p.inbuf = make([]int16, bufferLength)
-	p.outbuf = make([]int16, bufferLength)
-	p.stream, err = portaudio.OpenDefaultStream(channels, channels, sampleRate, len(p.inbuf), p.inbuf, p.outbuf)
+	p.stream, err = portaudio.OpenDefaultStream(p.channels, p.channels, float64(p.sampleRate), len(p.inbuf), p.inbuf, p.outbuf)
 	if err != nil {
 		return err
 	}
@@ -122,30 +157,28 @@ func (p *process) run() error {
 
 	p.wg.Add(5)
 	go p.monitorLoop()
-	go p.inputLoop()
-	go p.sendLoop()
-	go p.receiveLoop()
-	go p.outputLoop()
+	go p.inputSendLoop()
+	go p.receiveOutputLoop()
 
 	<-p.exit
 
-	p.closePipe()
+	fmt.Println()
+	log.Print("Exit...")
 
 	return nil
-}
-func (p *process) closePipe() {
-	p.inputReader.Close()
-	p.inputWriter.Close()
-	p.outputReader.Close()
-	p.outputWriter.Close()
 }
 
 func (p *process) wait() {
 	p.wg.Wait()
 }
 
-func (p *process) inputLoop() {
+func (p *process) inputSendLoop() {
 	defer p.wg.Done()
+
+	enc, err := opus.NewEncoder(p.sampleRate, p.channels, opus.AppVoIP)
+	if err != nil {
+		panic(err)
+	}
 
 	for {
 		select {
@@ -161,48 +194,30 @@ func (p *process) inputLoop() {
 				return
 			}
 
-			p.inputSize += uint64(len(p.inbuf) * 2)
+			p.inputSize += uint64(p.frameSize * 2)
 
-			err = binary.Write(p.inputWriter, binary.LittleEndian, p.inbuf)
+			data := make([]byte, p.opusDataLength)
+			n, err := enc.Encode(p.inbuf, data)
 			if err != nil {
-				if err != io.ErrClosedPipe {
-					log.Printf("error write to input pipe : %v", err)
-				}
+				log.Printf("error encode opus : %v", err)
 				return
 			}
+
+			p.client.Send(vchat.AudioFrame{
+				Data: data[:n],
+			})
+			p.sendSize += uint64(n)
 		}
 	}
 }
 
-func (p *process) sendLoop() {
+func (p *process) receiveOutputLoop() {
 	defer p.wg.Done()
 
-	data := make([]byte, 1000)
-	for {
-		select {
-		case _, ok := <-p.exit:
-			if !ok {
-				return
-			}
-		default:
-			for offset := 0; offset < len(data); {
-				n, err := p.inputReader.Read(data[offset:len(data)])
-				if err != nil {
-					if err != io.ErrClosedPipe {
-						log.Printf("error read from input pipe : %v", err)
-					}
-					return
-				}
-				offset += n
-			}
-			p.client.Send(data)
-			p.sendSize += uint64(len(data))
-		}
+	dec, err := opus.NewDecoder(p.sampleRate, p.channels)
+	if err != nil {
+		panic(err)
 	}
-}
-
-func (p *process) receiveLoop() {
-	defer p.wg.Done()
 
 	for {
 		select {
@@ -210,39 +225,15 @@ func (p *process) receiveLoop() {
 			if !ok {
 				return
 			}
-		case data := <-p.client.Receive:
-			for offset := 0; offset < len(data); {
-				n, err := p.outputWriter.Write(data[offset:len(data)])
-				if err != nil {
-					if err != io.ErrClosedPipe {
-						log.Printf("error write to output pipe : %v", err)
-					}
-					return
-				}
-				offset += n
-			}
-			p.receiveSize += uint64(len(data))
-		}
-	}
-}
+		case frame := <-p.client.Receive:
+			p.receiveSize += uint64(len(frame.Data))
 
-func (p *process) outputLoop() {
-	defer p.wg.Done()
-
-	for {
-		select {
-		case _, ok := <-p.exit:
-			if !ok {
-				return
-			}
-		default:
-			err := binary.Read(p.outputReader, binary.LittleEndian, &p.outbuf)
+			_, err = dec.Decode(frame.Data, p.outbuf)
 			if err != nil {
-				if err != io.ErrClosedPipe {
-					log.Printf("error read from output pipe : %v", err)
-				}
+				log.Printf("error decode opus : %v", err)
 				return
 			}
+
 			err = p.stream.Write()
 			if err != nil && err != portaudio.OutputUnderflowed {
 				log.Printf("error write to audio stream : %v", err)
@@ -268,12 +259,19 @@ func (p *process) monitorLoop() {
 				return
 			}
 		case now := <-t.C:
-			fmt.Printf("Input : %d, Send : %d, Receive : %d, Output : %d\n", p.inputSize, p.sendSize, p.receiveSize, p.outputSize)
 			inputRate := float64(p.inputSize-input) / now.Sub(prevTime).Seconds()
 			sendRate := float64(p.sendSize-send) / now.Sub(prevTime).Seconds()
 			receiveRate := float64(p.receiveSize-receive) / now.Sub(prevTime).Seconds()
 			outputRate := float64(p.outputSize-output) / now.Sub(prevTime).Seconds()
-			fmt.Printf("Input : %f/s, Send : %f/s, Receive : %f/s, Output : %f/s\n", inputRate, sendRate, receiveRate, outputRate)
+			fmt.Printf("\rInput : %s (%s/s), Send : %s (%s/s), Receive : %s (%s/s), Output : %s (%s/s)",
+				humanize.Bytes(p.inputSize),
+				humanize.Bytes(uint64(inputRate)),
+				humanize.Bytes(p.sendSize),
+				humanize.Bytes(uint64(sendRate)),
+				humanize.Bytes(p.receiveSize),
+				humanize.Bytes(uint64(receiveRate)),
+				humanize.Bytes(p.outputSize),
+				humanize.Bytes(uint64(outputRate)))
 
 			input = p.inputSize
 			send = p.sendSize
@@ -287,7 +285,10 @@ func (p *process) monitorLoop() {
 func run() (int, error) {
 	var err error
 
-	p := newProcess()
+	p, err := newProcess()
+	if err != nil {
+		return 1, err
+	}
 
 	err = p.parseArgs()
 	if err != nil {

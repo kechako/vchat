@@ -18,9 +18,9 @@ const (
 )
 
 type Packet struct {
-	Type     PacketType
-	ClientID uuid.UUID
-	Data     []byte
+	Type        PacketType
+	ClientID    uuid.UUID
+	AudioFrames []AudioFrame
 }
 
 var (
@@ -30,8 +30,18 @@ var (
 	_ encoding.BinaryUnmarshaler = (*Packet)(nil)
 )
 
-func (p *Packet) binarySize() int {
-	return 1 + len(p.ClientID) + 2 + len(p.Data)
+func (p *Packet) BinarySize() int {
+	// Packet type + ClientID + AudioFrames
+	return 1 + len(p.ClientID) + p.audioFramesSize()
+}
+
+func (p *Packet) audioFramesSize() int {
+	size := 0
+	for _, frame := range p.AudioFrames {
+		size += frame.BinarySize()
+	}
+
+	return size
 }
 
 func (p *Packet) WriteTo(w io.Writer) (int64, error) {
@@ -47,18 +57,17 @@ func (p *Packet) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 
-	length := uint16(len(p.Data))
-	err = binary.Write(w, binary.BigEndian, length)
+	audioSize := uint16(p.audioFramesSize())
+	err = binary.Write(w, binary.BigEndian, audioSize)
 
-	for offset := 0; offset < len(p.Data); {
-		n, err := w.Write(p.Data[offset:len(p.Data)])
+	for _, frame := range p.AudioFrames {
+		_, err = frame.WriteTo(w)
 		if err != nil {
 			return 0, err
 		}
-		offset += n
 	}
 
-	return int64(p.binarySize()), nil
+	return int64(p.BinarySize()), nil
 }
 
 func (p *Packet) ReadFrom(r io.Reader) (int64, error) {
@@ -78,27 +87,36 @@ func (p *Packet) ReadFrom(r io.Reader) (int64, error) {
 	}
 	p.ClientID = clientID
 
-	var length uint16
-	err = binary.Read(r, binary.BigEndian, &length)
+	var audioLength uint16
+	err = binary.Read(r, binary.BigEndian, &audioLength)
 	if err != nil {
 		return 0, err
 	}
 
-	data := make([]byte, length)
-	for offset := 0; offset < int(length); {
-		n, err := r.Read(data[offset:length])
+	data := make([]byte, audioLength)
+	_, err = io.ReadFull(r, data)
+	if err != nil {
+		return 0, err
+	}
+	buf := bytes.NewBuffer(data)
+
+	for {
+		a := AudioFrame{}
+		_, err := a.ReadFrom(buf)
 		if err != nil {
+			if err == io.EOF {
+				break
+			}
 			return 0, err
 		}
-		offset += n
+		p.AudioFrames = append(p.AudioFrames, a)
 	}
-	p.Data = data
 
-	return int64(p.binarySize()), nil
+	return int64(p.BinarySize()), nil
 }
 
 func (p *Packet) MarshalBinary() ([]byte, error) {
-	buf := bytes.NewBuffer(make([]byte, 0, p.binarySize()))
+	buf := bytes.NewBuffer(make([]byte, 0, p.BinarySize()))
 	_, err := p.WriteTo(buf)
 	if err != nil {
 		return nil, err
@@ -110,6 +128,79 @@ func (p *Packet) MarshalBinary() ([]byte, error) {
 func (p *Packet) UnmarshalBinary(data []byte) error {
 	r := bytes.NewReader(data)
 	_, err := p.ReadFrom(r)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type AudioFrame struct {
+	Data []byte
+}
+
+var (
+	_ io.WriterTo                = (*AudioFrame)(nil)
+	_ io.ReaderFrom              = (*AudioFrame)(nil)
+	_ encoding.BinaryMarshaler   = (*AudioFrame)(nil)
+	_ encoding.BinaryUnmarshaler = (*AudioFrame)(nil)
+)
+
+func (a *AudioFrame) BinarySize() int {
+	// length + data
+	return 2 + len(a.Data)
+}
+
+func (a *AudioFrame) WriteTo(w io.Writer) (int64, error) {
+	var err error
+
+	length := uint16(len(a.Data))
+	if length == 0 {
+		return 0, nil
+	}
+
+	err = binary.Write(w, binary.BigEndian, length)
+
+	_, err = w.Write(a.Data)
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(a.BinarySize()), nil
+}
+
+func (a *AudioFrame) ReadFrom(r io.Reader) (int64, error) {
+	var err error
+
+	var length uint16
+	err = binary.Read(r, binary.BigEndian, &length)
+	if err != nil {
+		return 0, err
+	}
+
+	data := make([]byte, length)
+	_, err = io.ReadFull(r, data)
+	if err != nil {
+		return 0, err
+	}
+	a.Data = data
+
+	return int64(a.BinarySize()), nil
+}
+
+func (a *AudioFrame) MarshalBinary() ([]byte, error) {
+	buf := bytes.NewBuffer(make([]byte, 0, a.BinarySize()))
+	_, err := a.WriteTo(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (a *AudioFrame) UnmarshalBinary(data []byte) error {
+	r := bytes.NewReader(data)
+	_, err := a.ReadFrom(r)
 	if err != nil {
 		return err
 	}
